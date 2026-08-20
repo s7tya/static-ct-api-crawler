@@ -1,31 +1,30 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::Client;
+use url::Url;
 
 pub struct StaticCtLogClient {
-    base_url: String,
+    monitoring_prefix: Url,
     client: Client,
 }
 
 #[derive(Debug)]
 pub struct Checkpoint {
-    tree_size: usize,
-    root_hash: Vec<u8>,
+    pub tree_size: usize,
+    pub root_hash: Vec<u8>,
 }
 
 impl StaticCtLogClient {
-    pub fn new(base_url: impl Into<String>) -> Self {
+    pub fn new(monitoring_prefix: impl Into<Url>) -> Self {
         let client = Client::new();
-        let base_url = base_url.into();
-
-        Self { base_url, client }
+        Self {
+            monitoring_prefix: monitoring_prefix.into(),
+            client,
+        }
     }
 
     pub async fn get_checkpoint(&self) -> anyhow::Result<Checkpoint> {
-        let resp = self
-            .client
-            .get(format!("{}/checkpoint", self.base_url))
-            .send()
-            .await?;
+        let url = self.monitoring_prefix.join("checkpoint")?;
+        let resp = self.client.get(url).send().await?;
         let text = resp.text().await?;
         let mut lines = text.split("\n");
 
@@ -42,7 +41,9 @@ impl StaticCtLogClient {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = StaticCtLogClient::new("https://mon.sycamore.ct.letsencrypt.org/2026h1");
+    let client = StaticCtLogClient::new(Url::parse(
+        "https://mon.sycamore.ct.letsencrypt.org/2026h1/",
+    )?);
     let checkpoint = client.get_checkpoint().await?;
     println!("{:?}", checkpoint);
 
