@@ -1,10 +1,11 @@
 use std::{
-    fmt::{self},
+    fmt,
     fs::{self, File},
     io::{Read, Write},
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
+use futures::{StreamExt, future, stream};
 use reqwest::Client;
 use url::Url;
 
@@ -35,6 +36,21 @@ impl fmt::Display for Checkpoint {
     }
 }
 
+fn encode_tile_idx(mut index: usize) -> String {
+    let mut parts = vec![format!("{:03}", index % 1000)];
+
+    index /= 1000;
+    while index > 0 {
+        parts.push(format!("x{:03}", index % 1000));
+        index /= 1000;
+    }
+
+    parts.reverse();
+    parts.join("/")
+}
+
+const CONCURRENCY: usize = 20;
+
 impl StaticCtLogClient {
     pub fn new(monitoring_prefix: impl Into<Url>) -> Self {
         let client = Client::new();
@@ -56,6 +72,44 @@ impl StaticCtLogClient {
         let root_hash = STANDARD.decode(root_hash_base64)?;
 
         Ok(Checkpoint::new(tree_size, root_hash))
+    }
+
+    pub async fn get_tiles(&self, from: usize, to: usize) -> anyhow::Result<()> {
+        let start_tile = from / 256;
+        let entries_to_skip = from % 256;
+
+        let end_tile = to.div_ceil(256);
+        let partial = match to % 256 {
+            0 => None,
+            n => Some(n),
+        };
+
+        let urls = (start_tile..end_tile)
+            .flat_map(|idx| {
+                self.monitoring_prefix
+                    .join(&format!(
+                        "tile/data/{}{}",
+                        encode_tile_idx(idx),
+                        if let Some(n) = partial
+                            && idx + 1 == end_tile
+                        {
+                            format!(".p/{n}")
+                        } else {
+                            String::new()
+                        }
+                    ))
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+
+        let resps = stream::iter(urls)
+            .map(|url| async move { self.client.get(url).send().await.ok()?.bytes().await.ok() })
+            .buffer_unordered(CONCURRENCY)
+            .filter_map(|it| async move { it })
+            .collect::<Vec<_>>()
+            .await;
+
+        Ok(())
     }
 }
 
@@ -85,6 +139,10 @@ async fn main() -> anyhow::Result<()> {
         {
             return Err(anyhow::anyhow!("invalid checkpoint"));
         }
+
+        client
+            .get_tiles(prev_checkpoint.tree_size, checkpoint.tree_size)
+            .await?;
     }
 
     let mut file = File::create("./checkpoint.txt")?;
