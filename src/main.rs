@@ -7,9 +7,12 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use futures::{StreamExt, future, stream};
+use bytes::Bytes;
+use futures::{Stream, StreamExt, stream};
 use reqwest::Client;
 use url::Url;
+
+use crate::parser::parse_tile_leaf;
 
 pub struct StaticCtLogClient {
     monitoring_prefix: Url,
@@ -76,9 +79,12 @@ impl StaticCtLogClient {
         Ok(Checkpoint::new(tree_size, root_hash))
     }
 
-    pub async fn get_tiles(&self, from: usize, to: usize) -> anyhow::Result<()> {
+    pub fn tiles_stream(
+        &self,
+        from: usize,
+        to: usize,
+    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<(usize, Bytes)>> + '_> {
         let start_tile = from / 256;
-        let entries_to_skip = from % 256;
 
         let end_tile = to.div_ceil(256);
         let partial = match to % 256 {
@@ -87,7 +93,7 @@ impl StaticCtLogClient {
         };
 
         let urls = (start_tile..end_tile)
-            .flat_map(|idx| {
+            .map(|idx| {
                 self.monitoring_prefix
                     .join(&format!(
                         "tile/data/{}{}",
@@ -100,18 +106,23 @@ impl StaticCtLogClient {
                             String::new()
                         }
                     ))
-                    .ok()
+                    .map(|url| (idx, url))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let resps = stream::iter(urls)
-            .map(|url| async move { self.client.get(url).send().await.ok()?.bytes().await.ok() })
-            .buffer_unordered(CONCURRENCY)
-            .filter_map(|it| async move { it })
-            .collect::<Vec<_>>()
-            .await;
-
-        Ok(())
+        Ok(stream::iter(urls)
+            .map(move |(idx, url)| async move {
+                let bytes = self
+                    .client
+                    .get(url)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .bytes()
+                    .await?;
+                Ok((idx, bytes))
+            })
+            .buffer_unordered(CONCURRENCY))
     }
 }
 
@@ -142,9 +153,22 @@ async fn main() -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("invalid checkpoint"));
         }
 
-        client
-            .get_tiles(prev_checkpoint.tree_size, checkpoint.tree_size)
-            .await?;
+        let mut resps = client.tiles_stream(prev_checkpoint.tree_size, checkpoint.tree_size)?;
+        while let Some(result) = resps.next().await {
+            let (tile_index, bytes) = result?;
+            let mut input = bytes.as_ref();
+            let mut entry_index = tile_index * 256;
+            let mut leaves = vec![];
+
+            while !input.is_empty() {
+                let leaf = parse_tile_leaf(&mut input)
+                    .map_err(|err| anyhow::anyhow!("failed to parse tile {tile_index}: {err}"))?;
+                if entry_index >= prev_checkpoint.tree_size && entry_index < checkpoint.tree_size {
+                    leaves.push(leaf);
+                }
+                entry_index += 1;
+            }
+        }
     }
 
     let mut file = File::create("./checkpoint.txt")?;
