@@ -1,6 +1,7 @@
 mod parser;
 
 use std::{
+    collections::HashSet,
     fmt,
     fs::{self, File},
     io::{Read, Write},
@@ -12,7 +13,7 @@ use futures::{Stream, StreamExt, stream};
 use reqwest::Client;
 use url::Url;
 
-use crate::parser::parse_tile_leaf;
+use crate::parser::{domain_names, parse_tile_leaf};
 
 pub struct StaticCtLogClient {
     monitoring_prefix: Url,
@@ -158,13 +159,17 @@ async fn main() -> anyhow::Result<()> {
             let (tile_index, bytes) = result?;
             let mut input = bytes.as_ref();
             let mut entry_index = tile_index * 256;
-            let mut leaves = vec![];
+            let mut hosts = HashSet::new();
 
             while !input.is_empty() {
                 let leaf = parse_tile_leaf(&mut input)
                     .map_err(|err| anyhow::anyhow!("failed to parse tile {tile_index}: {err}"))?;
                 if entry_index >= prev_checkpoint.tree_size && entry_index < checkpoint.tree_size {
-                    leaves.push(leaf);
+                    for domain in domain_names(&leaf)? {
+                        if hosts.insert(domain.to_string()) {
+                            println!("{domain}");
+                        }
+                    }
                 }
                 entry_index += 1;
             }

@@ -5,6 +5,11 @@ use winnow::{
     combinator::{eof, fail, repeat, terminated},
     token::take,
 };
+use x509_parser::{
+    certificate::{TbsCertificate, X509Certificate},
+    extensions::GeneralName,
+    prelude::FromDer,
+};
 
 #[repr(u8)]
 #[derive(Debug, PartialEq, Eq, FromPrimitive)]
@@ -171,4 +176,39 @@ pub fn parse_tile_leaf<'a>(input: &mut &'a [u8]) -> Result<TileLeaf<'a>> {
             .parse_next(input),
         _ => fail.parse_next(input),
     }
+}
+
+pub fn domain_names<'a>(leaf: &TileLeaf<'a>) -> anyhow::Result<Vec<&'a str>> {
+    let (remaining, tbs) = match leaf {
+        TileLeaf::X509Entry {
+            timestamped_entry, ..
+        } => {
+            let der = timestamped_entry.signed_entry.0;
+            X509Certificate::from_der(der)
+                .map(|(remaining, cert)| (remaining, cert.tbs_certificate))
+        }
+        TileLeaf::PrecertEntry {
+            timestamped_entry, ..
+        } => {
+            let der = timestamped_entry.signed_entry.tbs_certificate.0;
+            TbsCertificate::from_der(der)
+        }
+    }
+    .map_err(|err| anyhow::anyhow!("failed to parse certificate: {err}"))?;
+
+    anyhow::ensure!(remaining.is_empty(), "trailing data in certificate");
+
+    let Some(san) = tbs.subject_alternative_name()? else {
+        return Ok(Vec::new());
+    };
+
+    Ok(san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::DNSName(domain) => Some(*domain),
+            _ => None,
+        })
+        .collect())
 }
